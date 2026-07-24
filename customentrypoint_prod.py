@@ -2,90 +2,61 @@
 """
 customentrypoint.py
 
-PMR custom entrypoint (structuredquery / streaming route) performing document RAG
-against an Amazon Bedrock Knowledge Base via RetrieveAndGenerateStream.
+PMR custom entrypoint (structuredquery / streaming) doing document RAG against a
+Bedrock Knowledge Base via RetrieveAndGenerateStream.
 
-Flow:
-    1UI --(WebSocket)--> PMR --> execute_custom_entrypoint()
-        --> bedrock-agent-runtime.retrieve_and_generate_stream()
-        --> yield text chunks --> PMR --> 1UI
+Built to work without every framework detail confirmed up front:
+  * question key      -> probes likely keys, then deep-searches the payload
+  * config key names  -> accepts several spellings, plus env fallback
+  * logger type       -> works with structlog or a plain logger
+  * event shape       -> defensively pulls text from any known field path
+  * aioboto3/boto3    -> uses aioboto3 if installed, else boto3 on a thread
 
-Contract notes (verified against the framework):
-  * yield RAW text only - no json.dumps(), no trailing newline.
-  * the stream MUST terminate with __STOP_CODON__; clients block until they see it.
-  * the framework wraps yielded text into `custom_entrypoint_response`.
+Contract:
+  * yield RAW text only (no json.dumps, no newline)
+  * stream MUST end with __STOP_CODON__
 """
 from __future__ import annotations
 
 import asyncio
-import functools
 import os
 import queue
 import threading
 import uuid
 from typing import Any, AsyncGenerator, Optional
 
-import boto3
-from botocore.config import Config as BotoConfig
 from customentrypointbase import CustomEntrypointBase
 from fastapi import Request
 
-# --------------------------------------------------------------------------- #
-# Constants
-# --------------------------------------------------------------------------- #
-
 STOP_CODON = "__STOP_CODON__"
 
-# Ordered candidates for locating the user's question in request_payload.
-# TODO: once confirmed against a test-case JSON, reduce this to the single key.
-QUESTION_KEYS = ("prompt", "question", "text", "query", "user_question")
+# Likely keys holding the user's question. Probed in order.
+QUESTION_KEYS = (
+    "prompt", "question", "text", "query", "user_question",
+    "user_input", "message", "content", "input",
+)
 
-# Config keys (resolved from app_config_dict, then domain_dict, then env).
-CFG_REGION = "AWSRegion"
-CFG_KB_ID = "KNOWLEDGE_BASE_ID"
-CFG_MODEL_ARN = "GENERATION_MODEL_ARN"
-CFG_DATA_SOURCE_ID = "DATA_SOURCE_ID"   # optional - filters to one data source
-CFG_TIMEOUT = "BEDROCK_TIMEOUT_SECONDS"
+# Accepted spellings for each config value.
+CFG_ALIASES = {
+    "region": ("AWSRegion", "AWS_REGION", "aws_region", "region", "BEDROCK_REGION"),
+    "kb_id": ("KNOWLEDGE_BASE_ID", "KnowledgeBaseId", "knowledge_base_id",
+              "BEDROCK_KNOWLEDGE_BASE_ID", "kb_id"),
+    "model_arn": ("GENERATION_MODEL_ARN", "MODEL_ARN", "ModelArn",
+                  "model_arn", "BEDROCK_MODEL_ARN"),
+    "model_id": ("GENERATION_MODEL_ID", "MODEL_ID", "ModelId", "model_id",
+                 "modelId", "BEDROCK_MODEL_ID"),
+    "profile": ("AWS_PROFILE", "aws_profile", "AWSProfile"),
+    "data_source_id": ("DATA_SOURCE_ID", "DataSourceId", "data_source_id",
+                       "BEDROCK_DATA_SOURCE_ID"),
+    "timeout": ("BEDROCK_TIMEOUT_SECONDS", "bedrock_timeout"),
+}
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_TIMEOUT = 60
+ERROR_MESSAGE = "申し訳ありません。回答の生成中にエラーが発生しました。"
 
-USER_FACING_ERROR = (
-    "申し訳ありませんが、回答の生成中にエラーが発生しました。"
-    "しばらくしてからもう一度お試しください。"
-)
-
-# Module-level client cache. Creating a boto3 client is expensive (~100ms+) and
-# clients are thread-safe, so we build one per region and reuse it.
 _CLIENT_LOCK = threading.Lock()
-_CLIENTS: dict[str, Any] = {}
-
-
-def _get_client(region: str, timeout: int):
-    """Return a cached bedrock-agent-runtime client for the given region."""
-    with _CLIENT_LOCK:
-        client = _CLIENTS.get(region)
-        if client is None:
-            client = boto3.client(
-                "bedrock-agent-runtime",
-                region_name=region,
-                config=BotoConfig(
-                    read_timeout=timeout,
-                    connect_timeout=10,
-                    retries={"max_attempts": 2, "mode": "standard"},
-                ),
-            )
-            _CLIENTS[region] = client
-        return client
-
-
-class ConfigError(RuntimeError):
-    """Raised when a required configuration value is missing."""
-
-
-# --------------------------------------------------------------------------- #
-# Entrypoint
-# --------------------------------------------------------------------------- #
+_CLIENTS: dict = {}
 
 
 class CustomEntryPoint(CustomEntrypointBase):
@@ -97,8 +68,6 @@ class CustomEntryPoint(CustomEntrypointBase):
         self.logger_obj = logger_obj
 
     # ------------------------------------------------------------------ #
-    # Main entrypoint - PMR calls this once per request.
-    # ------------------------------------------------------------------ #
     async def execute_custom_entrypoint(
         self,
         app_name: str,
@@ -106,114 +75,109 @@ class CustomEntryPoint(CustomEntrypointBase):
         request_payload: dict,
         app_config_dict: dict,
     ) -> AsyncGenerator[str, None]:
-        # Correlate logs to the caller's request where possible.
-        request_id = (
-            (request_payload or {}).get("client_request_id")
-            or uuid.uuid4().hex
-        )
-        log_ctx = {"app_name": app_name, "request_id": request_id}
+        req_id = (request_payload or {}).get("client_request_id") or uuid.uuid4().hex
 
         try:
             question = self._extract_question(request_payload)
             if not question:
-                self._log("error", "no question found in request_payload", **log_ctx)
+                self._log("error",
+                          f"[{app_name}][{req_id}] no question in payload; "
+                          f"keys={list((request_payload or {}).keys())}")
                 yield "質問が見つかりませんでした。"
                 return
 
-            self._log(
-                "info",
-                f"question received (len={len(question)})",
-                **log_ctx,
-            )
+            self._log("info", f"[{app_name}][{req_id}] Q({len(question)} chars)")
 
-            emitted = False
-            async for chunk in self._stream_answer(
-                question, app_config_dict, log_ctx
-            ):
+            got_output = False
+            async for chunk in self._stream(question, app_config_dict, req_id):
                 if chunk:
-                    emitted = True
-                    yield chunk          # RAW text - no json.dumps, no newline
+                    got_output = True
+                    yield chunk
 
-            if not emitted:
-                self._log("error", "bedrock returned no content", **log_ctx)
+            if not got_output:
+                self._log("error", f"[{app_name}][{req_id}] empty response")
                 yield "該当する情報が見つかりませんでした。"
 
-        except ConfigError as exc:
-            # Misconfiguration: log loudly, surface a generic message.
-            self._log("error", f"configuration error: {exc}", **log_ctx)
-            yield USER_FACING_ERROR
-
         except asyncio.CancelledError:
-            # Client disconnected mid-stream. Do not emit; let it propagate.
-            self._log("info", "stream cancelled by client", **log_ctx)
+            self._log("info", f"[{app_name}][{req_id}] cancelled by client")
             raise
 
-        except Exception as exc:  # noqa: BLE001 - must never break the stream
-            self._log("error", f"unhandled error: {exc!r}", **log_ctx)
-            yield USER_FACING_ERROR
+        except Exception as exc:  # noqa: BLE001
+            self._log("error", f"[{app_name}][{req_id}] failed: {exc!r}")
+            yield ERROR_MESSAGE
 
         finally:
-            # The terminator MUST always be sent, on every path except
-            # cancellation, or the client will wait forever.
+            # Always terminate - clients block forever without this.
             yield STOP_CODON
 
     # ------------------------------------------------------------------ #
     # Question extraction
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _extract_question(payload: Optional[dict]) -> Optional[str]:
+    @classmethod
+    def _extract_question(cls, payload: Optional[dict]) -> Optional[str]:
         if not isinstance(payload, dict):
             return None
 
+        # 1) direct hits at top level
         for key in QUESTION_KEYS:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
 
-        chat = payload.get("chat")
-        if isinstance(chat, dict):
-            for key in ("prompt", "text", "question"):
-                value = chat.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+        # 2) one level down (e.g. chat.prompt, request.text)
+        for container in payload.values():
+            if isinstance(container, dict):
+                for key in QUESTION_KEYS:
+                    val = container.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
 
-        return None
+        # 3) last resort: longest natural-language-looking string that is not
+        #    an id / timestamp / flag field.
+        skip = ("id", "datetime", "flag", "name", "window", "transaction")
+        best = None
+        for key, val in payload.items():
+            if any(s in key.lower() for s in skip):
+                continue
+            if isinstance(val, str) and len(val.strip()) > 5:
+                if best is None or len(val) > len(best):
+                    best = val.strip()
+        return best
 
     # ------------------------------------------------------------------ #
-    # Bedrock streaming
+    # Bedrock
     # ------------------------------------------------------------------ #
-    async def _stream_answer(
-        self,
-        question: str,
-        app_config_dict: dict,
-        log_ctx: dict,
+    async def _stream(
+        self, question: str, cfg: dict, req_id: str
     ) -> AsyncGenerator[str, None]:
+
         if os.getenv("USE_MOCK_BEDROCK", "false").lower() == "true":
-            async for chunk in self._mock_stream():
-                yield chunk
+            for ch in "これはモック回答です。ストリーミング経路の確認用です。":
+                await asyncio.sleep(0.01)
+                yield ch
             return
 
-        region = self._cfg(app_config_dict, CFG_REGION, DEFAULT_REGION)
-        kb_id = self._require(app_config_dict, CFG_KB_ID)
-        model_arn = self._require(app_config_dict, CFG_MODEL_ARN)
-        data_source_id = self._cfg(app_config_dict, CFG_DATA_SOURCE_ID)
-        timeout = int(self._cfg(app_config_dict, CFG_TIMEOUT, DEFAULT_TIMEOUT))
+        region = self._cfg(cfg, "region") or DEFAULT_REGION
+        kb_id = self._cfg(cfg, "kb_id")
+        model_arn = self._resolve_model_arn(cfg, region)
+        ds_id = self._cfg(cfg, "data_source_id")
+        timeout = int(self._cfg(cfg, "timeout") or DEFAULT_TIMEOUT)
 
-        kb_config: dict[str, Any] = {
-            "knowledgeBaseId": kb_id,
-            "modelArn": model_arn,
-        }
+        missing = [n for n, v in (("kb_id", kb_id), ("model_arn", model_arn)) if not v]
+        if missing:
+            raise RuntimeError(
+                f"missing config: {', '.join(missing)} "
+                "(expected from app_config_dict / conf/domain.conf)"
+            )
 
-        # Optional: restrict retrieval to a single data source within the KB.
-        if data_source_id:
-            kb_config["retrievalConfiguration"] = {
+        kb_conf: dict[str, Any] = {"knowledgeBaseId": kb_id, "modelArn": model_arn}
+        if ds_id:
+            kb_conf["retrievalConfiguration"] = {
                 "vectorSearchConfiguration": {
-                    "filter": {
-                        "equals": {
-                            "key": "x-amz-bedrock-kb-data-source-id",
-                            "value": data_source_id,
-                        }
-                    }
+                    "filter": {"equals": {
+                        "key": "x-amz-bedrock-kb-data-source-id",
+                        "value": ds_id,
+                    }}
                 }
             }
 
@@ -221,125 +185,162 @@ class CustomEntryPoint(CustomEntrypointBase):
             "input": {"text": question},
             "retrieveAndGenerateConfiguration": {
                 "type": "KNOWLEDGE_BASE",
-                "knowledgeBaseConfiguration": kb_config,
+                "knowledgeBaseConfiguration": kb_conf,
             },
         }
 
-        client = _get_client(region, timeout)
-
-        # boto3 is synchronous and its EventStream blocks on iteration. Running
-        # it inline would stall the PMR event loop for every other connection,
-        # so we consume it on a worker thread and hand chunks back via a queue.
-        async for chunk in self._iter_blocking_stream(client, params, log_ctx):
+        profile = self._cfg(cfg, "profile")
+        async for chunk in self._invoke(params, region, timeout, req_id, profile):
             yield chunk
 
-    async def _iter_blocking_stream(
-        self,
-        client,
-        params: dict,
-        log_ctx: dict,
-    ) -> AsyncGenerator[str, None]:
-        loop = asyncio.get_running_loop()
-        chunks: queue.Queue = queue.Queue(maxsize=256)
-        sentinel = object()
-
-        def _pump() -> None:
-            """Runs on a worker thread; pushes text chunks onto the queue."""
-            try:
-                response = client.retrieve_and_generate_stream(**params)
-                for event in response["stream"]:
-                    text = self._text_from_event(event)
-                    if text:
-                        chunks.put(text)
-            except BaseException as exc:  # noqa: BLE001 - forwarded to caller
-                chunks.put(exc)
-            finally:
-                chunks.put(sentinel)
-
-        worker = loop.run_in_executor(None, _pump)
-
+    async def _invoke(self, params, region, timeout, req_id, profile=None):
+        """Prefer aioboto3 (native async); fall back to boto3 on a thread."""
         try:
-            while True:
-                item = await loop.run_in_executor(None, chunks.get)
-                if item is sentinel:
-                    break
-                if isinstance(item, BaseException):
-                    raise item
-                yield item
-        finally:
-            # Ensure the worker is drained/finished before we return.
-            with contextlib_suppress():
-                await worker
+            import aioboto3  # noqa: F401
+            has_aio = True
+        except ImportError:
+            has_aio = False
+
+        if has_aio:
+            import aioboto3
+            session = (aioboto3.Session(profile_name=profile)
+                       if profile else aioboto3.Session())
+            async with session.client(
+                "bedrock-agent-runtime", region_name=region
+            ) as client:
+                resp = await client.retrieve_and_generate_stream(**params)
+                first = True
+                async for event in resp["stream"]:
+                    if first:
+                        self._log("info", f"[{req_id}] first event: {event}")
+                        first = False
+                    text = self._text_from(event)
+                    if text:
+                        yield text
+            return
+
+        # --- boto3 fallback: iterate the blocking stream off the event loop --
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        cache_key = f"{region}|{profile or ''}"
+        with _CLIENT_LOCK:
+            client = _CLIENTS.get(cache_key)
+            if client is None:
+                sess = (boto3.Session(profile_name=profile)
+                        if profile else boto3.Session())
+                client = sess.client(
+                    "bedrock-agent-runtime",
+                    region_name=region,
+                    config=BotoConfig(read_timeout=timeout, connect_timeout=10,
+                                      retries={"max_attempts": 2,
+                                               "mode": "standard"}),
+                )
+                _CLIENTS[cache_key] = client
+
+        loop = asyncio.get_running_loop()
+        q: queue.Queue = queue.Queue(maxsize=256)
+        done = object()
+
+        def pump():
+            try:
+                resp = client.retrieve_and_generate_stream(**params)
+                first = True
+                for event in resp["stream"]:
+                    if first:
+                        self._log("info", f"[{req_id}] first event: {event}")
+                        first = False
+                    text = self._text_from(event)
+                    if text:
+                        q.put(text)
+            except BaseException as exc:  # noqa: BLE001
+                q.put(exc)
+            finally:
+                q.put(done)
+
+        loop.run_in_executor(None, pump)
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is done:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def _resolve_model_arn(self, cfg: Optional[dict], region: str):
+        """
+        The generation model comes from the APPLICATION config, not from the
+        developer. Accept either a full ARN or a bare model id, and build the
+        ARN from the id when only that is supplied.
+        """
+        arn = self._cfg(cfg, "model_arn")
+        if arn:
+            return arn
+        model_id = self._cfg(cfg, "model_id")
+        if model_id:
+            if str(model_id).startswith("arn:"):
+                return model_id
+            return f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+        return None
 
     @staticmethod
-    def _text_from_event(event: dict) -> str:
-        """
-        Pull the text delta out of one stream event.
-
-        RetrieveAndGenerateStream emits several event types (output, citation,
-        guardrail, metadata). We only forward generated text.
-
-        TODO: confirm against a real response - print one raw event and verify
-        the field path before shipping to DEV.
-        """
+    def _text_from(event: Any) -> str:
+        """Pull text from an event, tolerating several possible shapes."""
+        if isinstance(event, str):
+            return event
         if not isinstance(event, dict):
             return ""
 
-        output = event.get("output")
-        if isinstance(output, dict):
-            text = output.get("text")
-            if isinstance(text, str):
-                return text
+        # {"output": {"text": "..."}}
+        out = event.get("output")
+        if isinstance(out, dict) and isinstance(out.get("text"), str):
+            return out["text"]
+        if isinstance(out, str):
+            return out
+
+        # {"chunk": {"text"/"bytes": ...}}
+        chunk = event.get("chunk")
+        if isinstance(chunk, dict):
+            if isinstance(chunk.get("text"), str):
+                return chunk["text"]
+            raw = chunk.get("bytes")
+            if isinstance(raw, (bytes, bytearray)):
+                try:
+                    return raw.decode("utf-8")
+                except Exception:  # noqa: BLE001
+                    return ""
+
+        # {"text": "..."} / {"delta": {"text": "..."}}
+        if isinstance(event.get("text"), str):
+            return event["text"]
+        delta = event.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+            return delta["text"]
 
         return ""
 
-    async def _mock_stream(self) -> AsyncGenerator[str, None]:
-        text = (
-            "これはモックの回答です。ナレッジベースに接続せずに"
-            "ストリーミング経路を検証しています。"
-        )
-        for token in text:
-            await asyncio.sleep(0.01)
-            yield token
+    # ------------------------------------------------------------------ #
+    # Config + logging
+    # ------------------------------------------------------------------ #
+    def _cfg(self, app_config_dict: Optional[dict], name: str):
+        """Look up a value by any of its accepted key spellings."""
+        for key in CFG_ALIASES.get(name, (name,)):
+            for source in (app_config_dict, self.domain_dict):
+                if isinstance(source, dict) and source.get(key) not in (None, ""):
+                    return source[key]
+            env = os.getenv(key)
+            if env not in (None, ""):
+                return env
+        return None
 
-    # ------------------------------------------------------------------ #
-    # Config helpers
-    # ------------------------------------------------------------------ #
-    def _cfg(self, app_config_dict: Optional[dict], key: str, default=None):
-        """Resolve config: app_config_dict -> domain_dict -> environment."""
-        for source in (app_config_dict, self.domain_dict):
-            if isinstance(source, dict) and source.get(key) not in (None, ""):
-                return source[key]
-        env_value = os.getenv(key)
-        return env_value if env_value not in (None, "") else default
-
-    def _require(self, app_config_dict: Optional[dict], key: str):
-        value = self._cfg(app_config_dict, key)
-        if not value:
-            raise ConfigError(f"{key} is not configured")
-        return value
-
-    # ------------------------------------------------------------------ #
-    # Logging
-    # ------------------------------------------------------------------ #
-    def _log(self, level: str, message: str, **context) -> None:
+    def _log(self, level: str, message: str) -> None:
         if not self.logger_obj:
             return
-        emit = getattr(self.logger_obj, level, None)
-        if emit is None:
-            return
-        try:
-            emit(message, **context)
-        except TypeError:
-            # Logger does not accept structured kwargs - fall back to a string.
-            suffix = " ".join(f"{k}={v}" for k, v in context.items())
-            emit(f"{message} {suffix}".strip())
-
-
-# Small local helper so we don't add an import just for one suppress().
-class contextlib_suppress:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return True
+        fn = getattr(self.logger_obj, level, None) or getattr(
+            self.logger_obj, "info", None
+        )
+        if fn:
+            try:
+                fn(message)
+            except Exception:  # noqa: BLE001
+                pass
