@@ -1,7 +1,19 @@
-"""Throwaway local driver - plays PMR's role and calls your entrypoint once.
-Never deployed. Add to .gitignore."""
+"""Throwaway local driver - plays PMR's role. Never deployed."""
 import asyncio
 import os
+import sys
+import types
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+# The framework base class only exists inside the PMR container build.
+# Stub it for local testing - your logic doesn't use anything from it.
+stub = types.ModuleType("customentrypointbase")
+class CustomEntrypointBase:
+    pass
+stub.CustomEntrypointBase = CustomEntrypointBase
+sys.modules["customentrypointbase"] = stub
 
 from customentrypoint import CustomEntryPoint
 
@@ -19,13 +31,12 @@ async def main():
 
     payload = {
         "client_request_id": "t-001",
-        "prompt": "保険金の請求手続きについて教えてください",
+        "prompt": "勤怠管理について教えてください",
     }
     cfg = {
         "aws_region": "ap-northeast-1",
         "knowledge_base_id": "4SFRKUP5WR",
         "generation_model_arn": os.getenv("GENERATION_MODEL_ARN", ""),
-        # "data_source_id": os.getenv("DATA_SOURCE_ID", ""),
     }
 
     chunks = []
