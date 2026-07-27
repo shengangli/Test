@@ -1,0 +1,199 @@
+# pylint:skip-file
+"""
+customentrypoint.py
+
+PMRカスタムエントリーポイント（structuredqueryルート / ストリーミング）
+
+■ 全体の流れ:
+    1UI（チャット画面）
+      → PMRフレームワーク（WebSocket受信・ルーティング）
+      → このファイルの execute_custom_entrypoint()
+      → Bedrock RetrieveAndGenerateStream（検索＋回答生成を1コールで実行）
+      → yield でトークンを返す → PMRが1UIへストリーミング配信
+
+■ retrieval-lambda（handler.py）との関係:
+    - 質問抽出ロジックは handler.py の extract_question と同じキー・同じ優先順
+    - handler.py は retrieve（チャンク取得のみ）だったが、
+      本実装は retrieve_and_generate_stream で「検索＋LLM生成」を統合
+    - Lambda + API Gateway 構成は不要になり、PMRコンテナ内で完結
+
+■ 設定値の取得元: domain.conf の custom_entrypoint_config ブロック
+    knowledge_base_id     : Bedrock ナレッジベースID
+    data_source_id        : （任意）データソース絞り込み用ID
+    generation_model_arn  : 生成モデルのARN（jp.推論プロファイル）
+    aws_region            : ap-northeast-1（東京）
+"""
+import asyncio
+import uuid
+from typing import AsyncGenerator, Optional
+
+import aioboto3                                      # 非同期版boto3（requirements.txtに含まれる）
+from customentrypointbase import CustomEntrypointBase  # PMRフレームワークの基底クラス（コンテナ内に存在）
+from fastapi import Request
+
+# ストリーム終了マーカー。クライアント（1UI／テストクライアント）は
+# この文字列を受信するまで待ち続けるため、必ず最後に送る必要がある。
+STOP_CODON = "__STOP_CODON__"
+
+# 想定外エラー時にユーザーへ表示する汎用メッセージ
+# （スタックトレース等の内部情報をチャットに出さないため）
+ERROR_MESSAGE = "申し訳ありません。回答の生成中にエラーが発生しました。"
+
+
+class CustomEntryPoint(CustomEntrypointBase):
+    """PMRが起動時にインスタンス化し、リクエストごとに
+    execute_custom_entrypoint() を呼び出す。"""
+
+    domain_dict = None
+    logger_obj = None
+
+    def __init__(self, domain_dict, logger_obj):
+        # domain_dict : PMRが domain.conf から読み込んだ設定
+        # logger_obj  : PMRが用意するロガー（CloudWatch等へ出力される）
+        self.domain_dict = domain_dict
+        self.logger_obj = logger_obj
+
+    async def execute_custom_entrypoint(
+        self,
+        app_name: str,          # ルート上のアプリ名（ログ用）
+        request: Request,       # FastAPIのRequestオブジェクト（本実装では未使用）
+        request_payload: dict,  # 1UIから届いたメッセージ本体（質問が入っている）
+        app_config_dict: dict,  # domain.conf の custom_entrypoint_config の内容
+    ) -> AsyncGenerator[str, None]:
+        """メイン処理。async generator であることが重要:
+        yield した文字列を PMR が逐次 WebSocket で 1UI に送る＝ストリーミング。"""
+
+        # リクエスト追跡用ID（ログの突き合わせに使う）。
+        # クライアントが client_request_id を送ってくればそれを使い、なければ生成。
+        req_id = (request_payload or {}).get("client_request_id") or uuid.uuid4().hex
+        log = self.logger_obj
+
+        try:
+            # --- ステップ1: 質問を取り出す ---------------------------------
+            question = self._extract_question(request_payload)
+            if not question:
+                # 質問が見つからない場合はエラーメッセージを返して終了
+                # （finally で STOP_CODON は必ず送られる）
+                log.error(f"[{app_name}][{req_id}] no question in payload")
+                yield "質問が見つかりませんでした。"
+                return
+
+            log.info(f"[{app_name}][{req_id}] question received ({len(question)} chars)")
+
+            # --- ステップ2: Bedrockで検索＋生成し、逐次返す -----------------
+            async for text in self._stream_answer(question, app_config_dict):
+                # 契約: 生テキストのみを yield する。
+                # json.dumps や改行付与はNG（PMR側の仕様）。
+                yield text
+
+        except asyncio.CancelledError:
+            # ユーザーが回答途中でチャットを閉じた場合など。
+            # 正常なキャンセルなので再送出してPMRに処理を返す。
+            log.info(f"[{app_name}][{req_id}] cancelled by client")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # 想定外エラー: 詳細はログにのみ残し、
+            # ユーザーには汎用メッセージだけを表示する。
+            log.error(f"[{app_name}][{req_id}] failed: {exc!r}")
+            yield ERROR_MESSAGE
+        finally:
+            # ★最重要: どの経路（正常・エラー・質問なし）でも
+            # 必ず終了マーカーを送る。これが無いとクライアントは永遠に待つ。
+            yield STOP_CODON
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _extract_question(payload: Optional[dict]) -> Optional[str]:
+        """request_payload から質問文字列を取り出す。
+
+        retrieval-lambda（handler.py）の extract_question と
+        同じキー・同じ優先順位で探す:
+            1. payload["prompt"] / payload["question"]   … 直接キー
+            2. payload["chat"]["prompt"]                 … 1UIのネスト形式
+            3. payload["messages"] の最後のuser発言       … チャット履歴形式
+        見つからなければ None を返す（呼び出し側でエラー応答）。"""
+        if not isinstance(payload, dict):
+            return None
+
+        # 1) 直接キー: prompt / question
+        for key in ("prompt", "question"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        # 2) ネスト形式: chat.prompt（1UIが送る形）
+        chat = payload.get("chat")
+        if isinstance(chat, dict):
+            val = chat.get("prompt")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        # 3) チャット履歴形式: messages配列を末尾から遡り、
+        #    最後の role=="user" の content を質問とみなす
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if (isinstance(message, dict)
+                        and message.get("role") == "user"
+                        and isinstance(message.get("content"), str)
+                        and message["content"].strip()):
+                    return message["content"].strip()
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    async def _stream_answer(
+        self, question: str, cfg: dict
+    ) -> AsyncGenerator[str, None]:
+        """Bedrock RetrieveAndGenerateStream を1回呼び、
+        返ってくるイベントストリームからテキスト部分だけを yield する。
+
+        このAPI 1コールの内部で:
+            ・ナレッジベース検索（ベクトル検索）
+            ・上位チャンクをコンテキストにしたLLM回答生成
+            ・引用付きストリーミング返却
+        が全て行われる（handler.py の retrieve + 未実装だったLLM呼び出しに相当）。"""
+
+        # --- 設定値の取り出し（domain.conf 由来） --------------------------
+        region = cfg["aws_region"]                # 例: "ap-northeast-1"
+        kb_id = cfg["knowledge_base_id"]          # 例: "4SFRKUP5WR"
+        model_arn = cfg["generation_model_arn"]   # jp.推論プロファイルのARN
+        ds_id = cfg.get("data_source_id")         # 任意（無ければKB全体を検索）
+
+        # --- Bedrockへ渡すKB設定を組み立て --------------------------------
+        kb_conf = {"knowledgeBaseId": kb_id, "modelArn": model_arn}
+        if ds_id:
+            # データソースIDが指定されていれば、そのソースの文書だけに
+            # 検索対象を絞る（handler.py の filter と同じキーを使用）。
+            kb_conf["retrievalConfiguration"] = {
+                "vectorSearchConfiguration": {
+                    "filter": {"equals": {
+                        "key": "x-amz-bedrock-kb-data-source-id",
+                        "value": ds_id,
+                    }}
+                }
+            }
+
+        # --- 呼び出しとストリーミング -------------------------------------
+        # aioboto3: 非同期クライアント。async with でクローズ処理も自動。
+        # 認証情報はコンテナのIAMロールから自動取得（コード内に秘密情報なし）。
+        session = aioboto3.Session()
+        async with session.client(
+            "bedrock-agent-runtime", region_name=region
+        ) as client:
+            resp = await client.retrieve_and_generate_stream(
+                input={"text": question},                      # ユーザーの質問
+                retrieveAndGenerateConfiguration={
+                    "type": "KNOWLEDGE_BASE",                  # KBモードで実行
+                    "knowledgeBaseConfiguration": kb_conf,
+                },
+            )
+            # resp["stream"] はイベントの非同期イテレータ。
+            # テキスト断片は event["output"]["text"] に入って届く
+            # （ローカル検証で確認済みの形式）。
+            async for event in resp["stream"]:
+                output = event.get("output") if isinstance(event, dict) else None
+                if isinstance(output, dict):
+                    text = output.get("text")
+                    if text:
+                        yield text   # 1断片ずつPMR経由で1UIへ
