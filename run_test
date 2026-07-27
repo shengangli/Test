@@ -1,0 +1,46 @@
+"""Throwaway local driver - plays PMR's role and calls your entrypoint once.
+Never deployed. Add to .gitignore."""
+import asyncio
+import os
+
+from customentrypoint import CustomEntryPoint
+
+
+class L:
+    def info(self, *a, **k):
+        print("[info]", *a)
+
+    def error(self, *a, **k):
+        print("[error]", *a)
+
+
+async def main():
+    ce = CustomEntryPoint(domain_dict={}, logger_obj=L())
+
+    payload = {
+        "client_request_id": "t-001",
+        "prompt": "保険金の請求手続きについて教えてください",
+    }
+    cfg = {
+        "aws_region": "ap-northeast-1",
+        "knowledge_base_id": "4SFRKUP5WR",
+        "generation_model_arn": os.getenv("GENERATION_MODEL_ARN", ""),
+        # "data_source_id": os.getenv("DATA_SOURCE_ID", ""),
+    }
+
+    chunks = []
+    async for c in ce.execute_custom_entrypoint(
+        app_name="local-test",
+        request=None,
+        request_payload=payload,
+        app_config_dict=cfg,
+    ):
+        chunks.append(c)
+        print(repr(c))
+
+    print("-" * 50)
+    print("ANSWER:", "".join(x for x in chunks if x != "__STOP_CODON__"))
+    print("STOP SENT:", bool(chunks) and chunks[-1] == "__STOP_CODON__")
+
+
+asyncio.run(main())
