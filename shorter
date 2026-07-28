@@ -24,10 +24,12 @@ PMRカスタムエントリーポイント（structuredqueryルート / スト�
     aws_region            : ap-northeast-1（東京）
 """
 import asyncio
+import queue
+import threading
 import uuid
 from typing import AsyncGenerator, Optional
 
-import aioboto3                                      # 非同期版boto3（requirements.txtに含まれる）
+import boto3                                           # AWS SDK（同期版）。検証済みの経路。
 from customentrypointbase import CustomEntrypointBase  # PMRフレームワークの基底クラス（コンテナ内に存在）
 from fastapi import Request
 
@@ -152,7 +154,11 @@ class CustomEntryPoint(CustomEntrypointBase):
             ・ナレッジベース検索（ベクトル検索）
             ・上位チャンクをコンテキストにしたLLM回答生成
             ・引用付きストリーミング返却
-        が全て行われる（handler.py の retrieve + 未実装だったLLM呼び出しに相当）。"""
+        が全て行われる（handler.py の retrieve + 未実装だったLLM呼び出しに相当）。
+
+        boto3は同期ライブラリのため、ストリーム読み取りは別スレッドで行い、
+        キュー経由で非同期側へ渡す（PMRのイベントループを塞がないため）。
+        ※ローカル検証で成功した実績のある方式。"""
 
         # --- 設定値の取り出し（domain.conf 由来） --------------------------
         region = cfg["aws_region"]                # 例: "ap-northeast-1"
@@ -174,26 +180,45 @@ class CustomEntryPoint(CustomEntrypointBase):
                 }
             }
 
-        # --- 呼び出しとストリーミング -------------------------------------
-        # aioboto3: 非同期クライアント。async with でクローズ処理も自動。
+        # --- クライアント生成 ----------------------------------------------
         # 認証情報はコンテナのIAMロールから自動取得（コード内に秘密情報なし）。
-        session = aioboto3.Session()
-        async with session.client(
-            "bedrock-agent-runtime", region_name=region
-        ) as client:
-            resp = await client.retrieve_and_generate_stream(
-                input={"text": question},                      # ユーザーの質問
-                retrieveAndGenerateConfiguration={
-                    "type": "KNOWLEDGE_BASE",                  # KBモードで実行
-                    "knowledgeBaseConfiguration": kb_conf,
-                },
-            )
-            # resp["stream"] はイベントの非同期イテレータ。
-            # テキスト断片は event["output"]["text"] に入って届く
-            # （ローカル検証で確認済みの形式）。
-            async for event in resp["stream"]:
-                output = event.get("output") if isinstance(event, dict) else None
-                if isinstance(output, dict):
-                    text = output.get("text")
-                    if text:
-                        yield text   # 1断片ずつPMR経由で1UIへ
+        client = boto3.client("bedrock-agent-runtime", region_name=region)
+
+        # --- 別スレッドでストリームを読み、キューで受け渡す -----------------
+        loop = asyncio.get_running_loop()
+        q: queue.Queue = queue.Queue(maxsize=256)
+        done = object()   # 「読み終わり」を示す番兵オブジェクト
+
+        def pump():
+            """ワーカースレッド側: Bedrockを呼び、テキスト断片をキューに積む。"""
+            try:
+                resp = client.retrieve_and_generate_stream(
+                    input={"text": question},                  # ユーザーの質問
+                    retrieveAndGenerateConfiguration={
+                        "type": "KNOWLEDGE_BASE",              # KBモードで実行
+                        "knowledgeBaseConfiguration": kb_conf,
+                    },
+                )
+                # resp["stream"] はイベントのイテレータ。
+                # テキスト断片は event["output"]["text"] に入って届く
+                # （ローカル検証で確認済みの形式）。
+                for event in resp["stream"]:
+                    output = event.get("output") if isinstance(event, dict) else None
+                    if isinstance(output, dict) and output.get("text"):
+                        q.put(output["text"])
+            except BaseException as exc:  # noqa: BLE001
+                # 例外はキュー経由で非同期側へ転送し、そちらでraiseする
+                q.put(exc)
+            finally:
+                q.put(done)   # 必ず番兵を送って読み終わりを通知
+
+        loop.run_in_executor(None, pump)
+
+        # --- 非同期側: キューから取り出して yield --------------------------
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is done:
+                break                      # ストリーム終了
+            if isinstance(item, BaseException):
+                raise item                 # スレッド内の例外をここで再送出
+            yield item                     # テキスト断片を1つずつPMRへ
