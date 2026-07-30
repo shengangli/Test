@@ -26,15 +26,6 @@ from entrypoint.utilities.customactionbase import CustomEntrypointBase
 
 logger = logging.getLogger(__name__)
 
-# --- 設定 ---------------------------------------------------------------
-# TODO: get_app_secrets / domain.conf から読む形に差し替える
-KB_ID = "4SFRKUP5WR"
-AWS_REGION = "ap-northeast-1"
-MODEL_ARN = (
-    "arn:aws:bedrock:ap-northeast-1:777228421253:inference-profile/"
-    "jp.anthropic.claude-sonnet-4-5-20250929-v1:0"
-)
-
 NUM_RESULTS = 5
 STOP_CODON = "__STOP_CODON__"
 
@@ -42,7 +33,19 @@ STOP_CODON = "__STOP_CODON__"
 class CustomEntrypoint(CustomEntrypointBase):
     """structuredquery 用エントリポイント."""
 
-    async def execute_custom_entrypoint(self, request_payload):
+    def __init__(self, domain_dict=None, logger_obj=None):
+        self.domain_dict = domain_dict or {}
+        self.logger_obj = logger_obj or logger
+
+    async def execute_custom_entrypoint(
+        self,
+        app_name=None,
+        request=None,
+        request_payload=None,
+        app_config_dict=None,
+        **kwargs,
+    ):
+        cfg = app_config_dict or {}
         question = self._extract_question(request_payload)
 
         if not question:
@@ -54,10 +57,10 @@ class CustomEntrypoint(CustomEntrypointBase):
         try:
             # 同期の boto3 呼び出しをイベントループから外す
             answer_text, metadata_list = await asyncio.to_thread(
-                self._call_bedrock, question
+                self._call_bedrock, question, cfg
             )
         except Exception:
-            logger.exception("Bedrock RetrieveAndGenerate に失敗しました")
+            self.logger_obj.exception("Bedrock RetrieveAndGenerate に失敗しました")
             yield {"context_str": "検索中にエラーが発生しました。",
                    "retriever_metadata": []}
             yield STOP_CODON
@@ -73,31 +76,35 @@ class CustomEntrypoint(CustomEntrypointBase):
     @staticmethod
     def _extract_question(request_payload):
         """リクエストから質問文を取り出す."""
-        # TODO: 実際のペイロード構造に合わせて調整
-        if isinstance(request_payload, dict):
-            return (
-                request_payload.get("question")
-                or request_payload.get("query")
-                or request_payload.get("user_input")
-                or ""
-            ).strip()
-        return ""
+        if not isinstance(request_payload, dict):
+            return ""
+        return (request_payload.get("prompt") or "").strip()
 
     @staticmethod
-    def _call_bedrock(question):
+    def _call_bedrock(question, cfg):
         """RetrieveAndGenerate を1回呼び、(回答テキスト, メタデータ) を返す."""
-        client = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+        region = cfg.get("aws_region", "ap-northeast-1")
+        kb_id = cfg.get("knowledge_base_id")
+        model_arn = cfg.get("generation_model_arn")
+
+        if not kb_id or not model_arn:
+            raise ValueError(
+                "app_config_dict に knowledge_base_id / "
+                "generation_model_arn が設定されていません"
+            )
+
+        client = boto3.client("bedrock-agent-runtime", region_name=region)
 
         resp = client.retrieve_and_generate(
             input={"text": question},
             retrieveAndGenerateConfiguration={
                 "type": "KNOWLEDGE_BASE",
                 "knowledgeBaseConfiguration": {
-                    "knowledgeBaseId": KB_ID,
-                    "modelArn": MODEL_ARN,
+                    "knowledgeBaseId": kb_id,
+                    "modelArn": model_arn,
                     "retrievalConfiguration": {
                         "vectorSearchConfiguration": {
-                            "numberOfResults": NUM_RESULTS,
+                            "numberOfResults": cfg.get("num_results", NUM_RESULTS),
                         }
                     },
                 },
@@ -107,9 +114,6 @@ class CustomEntrypoint(CustomEntrypointBase):
         answer_text = (resp.get("output") or {}).get("text", "")
 
         # citations -> スライド仕様の retriever_metadata 形式へ
-        #   filename     <- url の末尾
-        #   url          <- metadata["x-amz-bedrock-kb-source-uri"]
-        #   page_content <- content["text"]
         metadata_list = []
         seen = set()
         for citation in resp.get("citations", []):
