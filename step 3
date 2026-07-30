@@ -1,23 +1,25 @@
 """
 structuredquery カスタムエントリポイント
 
-Bedrock Knowledge Base を RetrieveAndGenerate で検索・回答生成し、
-回答テキストと引用メタデータを 1 件の dict として yield する。
+Bedrock Knowledge Base を RetrieveAndGenerateStream で検索・回答生成し、
+回答テキストを逐次 str で yield したあと、
+最後に引用メタデータを 1 件の dict として yield する。
 
 ResponseHandler.make_success_response() は受け取った値をそのまま
-custom_entrypoint_response に格納するため、以下の形になる:
+custom_entrypoint_response に格納するため:
 
-  "custom_entrypoint_response": {
-      "context_str": "<生成された回答テキスト>",
-      "retriever_metadata": [
-          {"filename": "...", "url": "...", "page_content": "..."},
-          ...
-      ]
-  }
+  str を yield  -> "custom_entrypoint_response": "テキスト断片"   (1UI側で連結)
+  dict を yield -> "custom_entrypoint_response": {
+                       "context_str": "<回答全文>",
+                       "retriever_metadata": [
+                           {"filename": ..., "url": ..., "page_content": ...},
+                       ]
+                   }
 """
 
 import asyncio
 import logging
+import threading
 from pathlib import PurePosixPath
 
 import boto3
@@ -28,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 NUM_RESULTS = 5
 STOP_CODON = "__STOP_CODON__"
+
+_SOURCE_URI_KEY = "x-amz-bedrock-kb-source-uri"
 
 
 class CustomEntrypoint(CustomEntrypointBase):
@@ -54,20 +58,29 @@ class CustomEntrypoint(CustomEntrypointBase):
             yield STOP_CODON
             return
 
-        try:
-            # 同期の boto3 呼び出しをイベントループから外す
-            answer_text, metadata_list = await asyncio.to_thread(
-                self._call_bedrock, question, cfg
-            )
-        except Exception:
-            self.logger_obj.exception("Bedrock RetrieveAndGenerate に失敗しました")
-            yield {"context_str": "検索中にエラーが発生しました。",
-                   "retriever_metadata": []}
-            yield STOP_CODON
-            return
+        answer_parts = []
+        metadata_list = []
+        seen = set()
 
+        try:
+            async for kind, value in self._stream_bedrock(question, cfg):
+                if kind == "text":
+                    answer_parts.append(value)
+                    yield value                      # ← 逐次ストリーミング
+                elif kind == "citation":
+                    self._collect_references(value, metadata_list, seen)
+        except Exception:
+            self.logger_obj.exception("Bedrock RetrieveAndGenerateStream に失敗しました")
+            if not answer_parts:
+                # まだ何も送っていない場合のみエラー文言を返す
+                yield {"context_str": "検索中にエラーが発生しました。",
+                       "retriever_metadata": []}
+                yield STOP_CODON
+                return
+
+        # 最後に引用メタデータ
         yield {
-            "context_str": answer_text,
+            "context_str": "".join(answer_parts),
             "retriever_metadata": metadata_list,
         }
         yield STOP_CODON
@@ -75,14 +88,20 @@ class CustomEntrypoint(CustomEntrypointBase):
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_question(request_payload):
-        """リクエストから質問文を取り出す."""
+        """リクエストから質問文を取り出す (chat.prompt / prompt の両対応)."""
         if not isinstance(request_payload, dict):
             return ""
-        return (request_payload.get("prompt") or "").strip()
+        chat = request_payload.get("chat")
+        if isinstance(chat, dict) and chat.get("prompt"):
+            return str(chat["prompt"]).strip()
+        return str(request_payload.get("prompt") or "").strip()
 
-    @staticmethod
-    def _call_bedrock(question, cfg):
-        """RetrieveAndGenerate を1回呼び、(回答テキスト, メタデータ) を返す."""
+    # ------------------------------------------------------------------
+    async def _stream_bedrock(self, question, cfg):
+        """
+        同期イテレータである EventStream を別スレッドで回し、
+        ("text", str) / ("citation", dict) を非同期に流す。
+        """
         region = cfg.get("aws_region", "ap-northeast-1")
         kb_id = cfg.get("knowledge_base_id")
         model_arn = cfg.get("generation_model_arn")
@@ -93,43 +112,90 @@ class CustomEntrypoint(CustomEntrypointBase):
                 "generation_model_arn が設定されていません"
             )
 
-        client = boto3.client("bedrock-agent-runtime", region_name=region)
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        _DONE = object()
 
-        resp = client.retrieve_and_generate(
-            input={"text": question},
-            retrieveAndGenerateConfiguration={
-                "type": "KNOWLEDGE_BASE",
-                "knowledgeBaseConfiguration": {
-                    "knowledgeBaseId": kb_id,
-                    "modelArn": model_arn,
-                    "retrievalConfiguration": {
-                        "vectorSearchConfiguration": {
-                            "numberOfResults": cfg.get("num_results", NUM_RESULTS),
-                        }
+        def worker():
+            try:
+                client = boto3.client("bedrock-agent-runtime", region_name=region)
+                resp = client.retrieve_and_generate_stream(
+                    input={"text": question},
+                    retrieveAndGenerateConfiguration={
+                        "type": "KNOWLEDGE_BASE",
+                        "knowledgeBaseConfiguration": {
+                            "knowledgeBaseId": kb_id,
+                            "modelArn": model_arn,
+                            "retrievalConfiguration": {
+                                "vectorSearchConfiguration": {
+                                    "numberOfResults": cfg.get(
+                                        "num_results", NUM_RESULTS
+                                    ),
+                                }
+                            },
+                        },
                     },
-                },
-            },
-        )
-
-        answer_text = (resp.get("output") or {}).get("text", "")
-
-        # citations -> スライド仕様の retriever_metadata 形式へ
-        metadata_list = []
-        seen = set()
-        for citation in resp.get("citations", []):
-            for ref in citation.get("retrievedReferences", []):
-                url = (ref.get("metadata") or {}).get(
-                    "x-amz-bedrock-kb-source-uri", ""
                 )
-                content = (ref.get("content") or {}).get("text", "")
-                key = (url, content)
-                if key in seen:
-                    continue
-                seen.add(key)
-                metadata_list.append({
-                    "filename": PurePosixPath(url).name if url else "",
-                    "url": url,
-                    "page_content": content,
-                })
+                for event in resp["stream"]:
+                    loop.call_soon_threadsafe(q.put_nowait, ("event", event))
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(q.put_nowait, ("error", exc))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, ("done", _DONE))
 
-        return answer_text, metadata_list
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            kind, payload = await q.get()
+
+            if kind == "done":
+                return
+            if kind == "error":
+                raise payload
+
+            event = payload
+
+            # テキストチャンク
+            output = event.get("output")
+            if isinstance(output, dict) and output.get("text"):
+                yield "text", output["text"]
+                continue
+
+            # 引用情報
+            citation = event.get("citation")
+            if citation:
+                # {"citation": {"citation": {...}}} / {"citation": {...}} 両対応
+                inner = citation.get("citation") if isinstance(citation, dict) else None
+                yield "citation", (inner if isinstance(inner, dict) else citation)
+                continue
+
+            # 例外系イベント
+            for key in (
+                "internalServerException",
+                "validationException",
+                "resourceNotFoundException",
+                "accessDeniedException",
+                "throttlingException",
+                "conflictException",
+                "dependencyFailedException",
+                "badGatewayException",
+            ):
+                if key in event:
+                    raise RuntimeError(f"{key}: {event[key]}")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _collect_references(citation, metadata_list, seen):
+        """citation イベントから retriever_metadata を積み上げる (重複除去)."""
+        for ref in (citation or {}).get("retrievedReferences", []) or []:
+            url = (ref.get("metadata") or {}).get(_SOURCE_URI_KEY, "")
+            content = (ref.get("content") or {}).get("text", "")
+            key = (url, content)
+            if key in seen:
+                continue
+            seen.add(key)
+            metadata_list.append({
+                "filename": PurePosixPath(url).name if url else "",
+                "url": url,
+                "page_content": content,
+            })
